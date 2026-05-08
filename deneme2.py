@@ -1,0 +1,278 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from shapely.geometry import Polygon, Point, MultiPolygon
+from matplotlib.widgets import Button, TextBox
+from scipy.spatial import Voronoi
+import copy
+
+# --- SİMÜLASYON SABİTLERİ ---
+ITERASYON_SAYISI = 100
+ANIMASYON_HIZI_MS = 50
+MIN_KOSSE_SAYISI = 3 
+MIN_DRONE_SAYISI = 1 
+MAX_DRONE_SAYISI = 200 
+INITIAL_DRONE_COUNT = 30
+
+class Environment:
+    def __init__(self, boundary_coords, obstacles_coords_list=None):
+        self.boundary_coords = np.array(boundary_coords)
+        self.polygon = Polygon(self.boundary_coords)
+        self.navigable_area = self.polygon
+        self.obstacles = []
+        
+        if obstacles_coords_list:
+            for obs_coords in obstacles_coords_list:
+                obs_poly = Polygon(obs_coords)
+                self.obstacles.append(obs_poly)
+                self.navigable_area = self.navigable_area.difference(obs_poly)
+        
+        rep_point = self.navigable_area.representative_point()
+        self.centroid = np.array([rep_point.x, rep_point.y])
+        
+        min_x, min_y, max_x, max_y = self.polygon.bounds
+        uzaklik = max(max_x - min_x, max_y - min_y) * 10
+        self.ghost_points = np.array([
+            [min_x - uzaklik, min_y - uzaklik],
+            [max_x + uzaklik, min_y - uzaklik],
+            [max_x + uzaklik, max_y + uzaklik],
+            [min_x - uzaklik, max_y + uzaklik]
+        ])
+
+class BaseSolver:
+    def __init__(self, env, drone_count, initial_positions, colors):
+        self.env = env
+        self.drone_count = drone_count
+        self.positions = copy.deepcopy(initial_positions)
+        self.colors = colors
+
+    def get_cell_areas(self):
+        """Her dronun kapsadığı güncel alan miktarını hesaplar."""
+        areas = []
+        pts = np.vstack((self.positions, self.env.ghost_points))
+        vor = Voronoi(pts)
+        for i in range(self.drone_count):
+            region = vor.regions[vor.point_region[i]]
+            if -1 in region or not region: 
+                areas.append(0)
+                continue
+            poly = Polygon([vor.vertices[v] for v in region])
+            try:
+                # Engelsiz alanla kesişim
+                inter = self.env.navigable_area.intersection(poly)
+                areas.append(inter.area if not inter.is_empty else 0)
+            except:
+                areas.append(0)
+        return np.array(areas)
+
+    def draw(self, ax, title):
+        ax.clear()
+        min_x, min_y, max_x, max_y = self.env.polygon.bounds
+        margin = max(max_x - min_x, max_y - min_y) * 0.05
+        ax.set_xlim(min_x - margin, max_x + margin)
+        ax.set_ylim(min_y - margin, max_y + margin)
+        
+        ax.plot(*self.env.polygon.exterior.xy, color='black', linewidth=2)
+        for obs in self.env.obstacles:
+            ax.fill(*obs.exterior.xy, color='black', alpha=0.6, hatch='//')
+        
+        # Voronoi Hücrelerini Çiz
+        pts = np.vstack((self.positions, self.env.ghost_points))
+        vor = Voronoi(pts)
+        for i in range(self.drone_count):
+            region = vor.regions[vor.point_region[i]]
+            if -1 in region or not region: continue
+            try:
+                poly = Polygon([vor.vertices[v] for v in region])
+                clipped = self.env.navigable_area.intersection(poly)
+                if not clipped.is_empty:
+                    if isinstance(clipped, MultiPolygon):
+                        for p in clipped.geoms:
+                            ax.fill(*p.exterior.xy, color=self.colors[i], alpha=0.5, edgecolor='white', lw=0.5)
+                    else:
+                        ax.fill(*clipped.exterior.xy, color=self.colors[i], alpha=0.5, edgecolor='white', lw=0.5)
+            except: pass
+
+        ax.scatter(self.positions[:, 0], self.positions[:, 1], c=self.colors, s=30, edgecolors='black', zorder=10)
+        ax.set_title(title, fontsize=10)
+        ax.set_aspect('equal')
+
+class APFSolver(BaseSolver):
+    def __init__(self, env, drone_count, initial_positions, colors):
+        super().__init__(env, drone_count, initial_positions, colors)
+        self.velocities = np.zeros((self.drone_count, 2))
+        
+        # SENİN ORİJİNAL PARAMETRELERİN
+        self.DT = 0.04
+        self.DAMPING = 0.6          
+        self.K_NOISE = 0.01
+        self.K_ATTRACT = 0.25       
+        self.K_REPEL_AGENT = 0.12   
+        self.REPULSION_DIST = 0.35 
+        self.K_REPEL_BOUND = 0.4 
+        self.BOUND_MARGIN = 0.15
+
+    def step(self):
+        forces = np.zeros((self.drone_count, 2))
+        
+        for i in range(self.drone_count):
+            pos_i = self.positions[i]
+            p_point = Point(pos_i)
+            
+            # 1. Çekim Kuvveti
+            vec_to_center = self.env.centroid - pos_i
+            forces[i] += self.K_ATTRACT * vec_to_center
+            
+            # 2. Ajanlar Arası İtme
+            for j in range(self.drone_count):
+                if i == j: continue
+                vec_ij = pos_i - self.positions[j]
+                dist_ij = np.linalg.norm(vec_ij)
+                if dist_ij < self.REPULSION_DIST:
+                    magnitude = self.K_REPEL_AGENT * (1.0 / (max(dist_ij, 0.04)))
+                    forces[i] += (vec_ij / (dist_ij + 1e-6)) * magnitude
+
+            # 3. Dış Sınır İtmesi
+            dist_to_boundary = p_point.distance(self.env.polygon.exterior)
+            is_inside = self.env.polygon.contains(p_point)
+            
+            if is_inside and dist_to_boundary < self.BOUND_MARGIN:
+                closest_p = self.env.polygon.exterior.interpolate(self.env.polygon.exterior.project(p_point))
+                vec_from_boundary = pos_i - np.array(closest_p.coords[0])
+                dist = np.linalg.norm(vec_from_boundary)
+                magnitude = self.K_REPEL_BOUND * (1.0 / (dist_to_boundary + 0.01))
+                forces[i] += (vec_from_boundary / (dist + 1e-6)) * magnitude
+            elif not is_inside:
+                forces[i] += (self.env.centroid - pos_i) * 5.0
+
+            # 4. İÇ ENGELLERDEN (Obstacles) İTME
+            for obs in self.env.obstacles:
+                dist_to_obs = p_point.distance(obs)
+                if dist_to_obs < self.BOUND_MARGIN:
+                    closest_p = obs.exterior.interpolate(obs.exterior.project(p_point))
+                    vec_from_obs = pos_i - np.array(closest_p.coords[0])
+                    dist = np.linalg.norm(vec_from_obs)
+                    magnitude = self.K_REPEL_BOUND * (1.0 / (dist_to_obs + 0.01))
+                    forces[i] += (vec_from_obs / (dist + 1e-6)) * magnitude
+
+        # Senin orijinal gürültü ve hız hesabın
+        forces += (np.random.rand(self.drone_count, 2) - 0.5) * self.K_NOISE
+        self.velocities = (self.velocities + forces * self.DT) * self.DAMPING
+        self.positions += self.velocities * self.DT
+        
+        # KATI SINIR VE ENGEL KONTROLÜ
+        for i in range(self.drone_count):
+            p_point = Point(self.positions[i])
+            if not self.env.polygon.contains(p_point):
+                closest = self.env.polygon.exterior.interpolate(self.env.polygon.exterior.project(p_point))
+                self.positions[i] = np.array(closest.coords[0])
+                self.velocities[i] = np.zeros(2)
+            else:
+                for obs in self.env.obstacles:
+                    if obs.contains(p_point):
+                        closest = obs.exterior.interpolate(obs.exterior.project(p_point))
+                        self.positions[i] = np.array(closest.coords[0])
+                        self.velocities[i] = np.zeros(2)
+                        break
+
+class LloydSolver(BaseSolver):
+    def step(self):
+        pts = np.vstack((self.positions, self.env.ghost_points))
+        vor = Voronoi(pts)
+        for i in range(self.drone_count):
+            region = vor.regions[vor.point_region[i]]
+            if -1 in region or not region: continue
+            try:
+                poly = Polygon([vor.vertices[v] for v in region])
+                clipped = self.env.navigable_area.intersection(poly)
+                if not clipped.is_empty and clipped.area > 0:
+                    self.positions[i] = np.array(clipped.centroid.coords[0])
+            except: pass
+
+class SimulationManager:
+    def __init__(self):
+        self.drone_count = INITIAL_DRONE_COUNT
+        self.boundary_coords = None
+        self.obstacles_coords_list = []
+        self.lloyd_history = []
+        self.apf_history = []
+        
+        self.fig = plt.figure(figsize=(14, 9))
+        self.fig.canvas.manager.set_window_title('Drone Dağılım Analizi')
+        
+    def setup_ui(self):
+        self.ax_setup = self.fig.add_subplot(111)
+        self.ax_setup.set_title("1. Drone Sayısı Girin -> 2. Alanı Çiz Butonuna Basın -> 3. Köşeleri Tıklayın (ENTER)", fontsize=12)
+        
+        ax_box = self.fig.add_axes([0.3, 0.05, 0.1, 0.05])
+        self.text_box = TextBox(ax_box, 'Drone: ', initial=str(self.drone_count))
+        
+        ax_btn = self.fig.add_axes([0.45, 0.05, 0.2, 0.05])
+        self.btn = Button(ax_btn, 'Alanı Tanımla', color='lightblue')
+        
+        def start_setup(event):
+            self.drone_count = int(self.text_box.text)
+            self.ax_setup.set_title("Dış Sınırı Çizin (Bitirmek için ENTER)")
+            self.fig.canvas.draw()
+            
+            coords = plt.ginput(n=-1, timeout=0, show_clicks=True)
+            if len(coords) >= 3:
+                self.boundary_coords = coords
+                self.ax_setup.plot(*Polygon(coords).exterior.xy, 'k-')
+                
+                while True:
+                    self.ax_setup.set_title("Engel Çizin (Pas geçmek/Bitirmek için doğrudan ENTER)")
+                    self.fig.canvas.draw()
+                    obs = plt.ginput(n=-1, timeout=0, show_clicks=True)
+                    if len(obs) < 3: break
+                    self.obstacles_coords_list.append(obs)
+                    self.ax_setup.fill(*Polygon(obs).exterior.xy, color='red', alpha=0.3)
+                
+                self.run_sim()
+
+        self.btn.on_clicked(start_setup)
+        plt.show()
+
+    def run_sim(self):
+        self.fig.clf()
+        self.ax1 = self.fig.add_subplot(221)
+        self.ax2 = self.fig.add_subplot(222)
+        self.ax_graph = self.fig.add_subplot(212)
+        self.fig.subplots_adjust(hspace=0.4, bottom=0.1)
+
+        env = Environment(self.boundary_coords, self.obstacles_coords_list)
+        colors = plt.cm.viridis(np.linspace(0, 1, self.drone_count))
+        
+        init_pos = env.centroid + (np.random.rand(self.drone_count, 2) - 0.5) * 0.5
+        
+        self.lloyd = LloydSolver(env, self.drone_count, init_pos, colors)
+        self.apf = APFSolver(env, self.drone_count, init_pos, colors)
+
+        def update(frame):
+            self.lloyd.step()
+            self.apf.step()
+            
+            self.lloyd.draw(self.ax1, f"Lloyd (Voronoi) - İterasyon: {frame}")
+            self.apf.draw(self.ax2, f"Potansiyel Alan (APF) - İterasyon: {frame}")
+            
+            # Verimlilik Analizi (Standart Sapma)
+            l_areas = self.lloyd.get_cell_areas()
+            a_areas = self.apf.get_cell_areas()
+            
+            self.lloyd_history.append(np.std(l_areas))
+            self.apf_history.append(np.std(a_areas))
+            
+            self.ax_graph.clear()
+            self.ax_graph.plot(self.lloyd_history, label='Lloyd (Daha Homojen)', color='blue', lw=2)
+            self.ax_graph.plot(self.apf_history, label='APF', color='red', lw=2)
+            self.ax_graph.set_title("Dağılım Verimliliği (Alan Standart Sapması - Düşük Değer Daha İyidir)")
+            self.ax_graph.set_ylabel("Standart Sapma ($\sigma$)")
+            self.ax_graph.set_xlabel("Adım")
+            self.ax_graph.legend()
+            self.ax_graph.grid(True, alpha=0.3)
+
+        self.ani = FuncAnimation(self.fig, update, frames=ITERASYON_SAYISI, interval=ANIMASYON_HIZI_MS, repeat=False)
+        self.fig.canvas.draw()
+
+if __name__ == "__main__":
+    SimulationManager().setup_ui()
