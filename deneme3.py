@@ -220,13 +220,14 @@ class SimulationManager:
     def setup_ui(self):
         self.ax_setup = self.fig.add_subplot(111)
         self.ax_setup.set_title("1. Drone Sayısı Girin -> 2. Alanı Çiz Butonuna Basın -> 3. Köşeleri Tıklayın (ENTER)", fontsize=12)
-        
+
+        self.fig.subplots_adjust(bottom=0.15)
         # 1. ax_box yerine self.ax_box yapıyoruz
-        self.ax_box = self.fig.add_axes([0.3, 0.05, 0.1, 0.05])
+        self.ax_box = self.fig.add_axes([0.3, 0.04, 0.1, 0.05])
         self.text_box = TextBox(self.ax_box, 'Drone: ', initial=str(self.drone_count))
         
         # 2. ax_btn yerine self.ax_btn yapıyoruz
-        self.ax_btn = self.fig.add_axes([0.45, 0.05, 0.2, 0.05])
+        self.ax_btn = self.fig.add_axes([0.45, 0.04, 0.2, 0.05])
         self.btn = Button(self.ax_btn, 'Alanı Tanımla', color='lightblue')
         
         def start_setup(event):
