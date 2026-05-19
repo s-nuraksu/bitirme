@@ -271,7 +271,7 @@ class SimulationManager:
         self.ax2 = self.fig.add_subplot(gs[0, 1])      # Üst Sağ
         self.ax_graph = self.fig.add_subplot(gs[1, :]) # Alt satırın tamamı
         
-        self.fig.subplots_adjust(bottom=0.08, left=0.05, right=0.95, top=0.92)
+        self.fig.subplots_adjust(bottom=0.08, left=0.1, right=0.90, top=0.92)
 
         env = Environment(self.boundary_coords, self.obstacles_coords_list)
         colors = plt.cm.viridis(np.linspace(0, 1, self.drone_count))
